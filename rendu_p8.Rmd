@@ -1,0 +1,1013 @@
+---
+title: "P8 Predisez la demande d'éléctricité"
+author: "muller gauthier"
+date: "03/05/2021"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+  html_notebook:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+  pdf_document:
+    toc: yes
+bibliography: references.bib
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+Contexte :
+
+Nous somme employé d'Enercoop, jeune entreprise spécialisé dans la fourniture d'énergie renouvelable
+
+But de l'étude :
+
+-   Prédire la consommation électrique sur 1 an
+
+-   Crée un modèle de prévision
+
+Pour cela, nous allons utilisé plusieurs modèles, plusieurs méthodes, de prédiction notamment :
+
+-   Lissage exponentielle
+
+-   SARIMA
+
+-   Machine learning
+
+-   Prophet
+
+Bibliographie :
+
+-   [Vincent Lefieux. Modèles semi-paramétriques appliqués à la prévision des séries temporelles. Cas de la consommation d'électricité.. Mathématiques [math]. Université Rennes 2, 2007. Français. fftel00179866f](https://tel.archives-ouvertes.fr/tel-00179866/document)
+
+-   [Forecasting: Principles and Practice (3rd ed). Rob J Hyndman and George Athanasopoulos. Monash University, Australia](https://otexts.com/fpp3/)
+
+-   [Modélisation et prévision de la consommation horaire d'électricité au Québec , Comparaison de méthodes de séries temporelles, Sylvestre Tatsa](https://docs.google.com/viewer?url=https%3A%2F%2Fcorpus.ulaval.ca%2Fjspui%2Fbitstream%2F20.500.11794%2F24781%2F1%2F30329.pdf)
+
+```{r setup, include=FALSE,warning=FALSE}
+## Option knitr
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE,fig.path='Figs/')
+#options(width = SOME-REALLY-BIG-VALUE)
+# Cran repo
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org"
+       options(repos=r)})
+## Set du repertoire de travail
+setwd(dir = "C:/Users/gauth/Google Drive/DataAnalyst/P9_Muller_Gauthier/")
+```
+
+```{r librairie, message=FALSE, warning=FALSE, cache=TRUE}
+## Install library
+library(tidyverse)
+library(lubridate)
+library(fabletools)
+library(fable)
+library(tsibble)
+library(feasts)
+library(car)
+library(dygraphs)
+library(broom)
+```
+
+# Imports des données
+
+Nous restreignons l'analyse à la région Grand Est avec comme capteur Strasbourg Entzheim.\
+La période s'étend 2013 et 2019
+
+## Consommation
+
+Source <https://www.rte-france.com/eco2mix/telecharger-les-indicateurs>
+
+### Imports des consommations electrique
+
+```{r imports des données RTE,echo=FALSE}
+RTE2019=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2019.csv",dec=",")
+RTE2018=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2018.csv",dec=",")
+RTE2017=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2017.csv",dec=",")
+RTE2016=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2016.csv",dec=",")
+RTE2015=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2015.csv",dec=",")
+RTE2014=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2014.csv",dec=",")
+RTE2013=read.csv("data/grand_est/eCO2mix_RTE_Grand-Est_Annuel-Definitif_2013.csv",dec=",")
+```
+
+### Création du df
+
+```{r warning=FALSE}
+## Ajout de toutes les années
+data_conso_grandest <- rbind(RTE2019,RTE2018,RTE2017,RTE2016,RTE2015,RTE2014,RTE2013)
+## modification du df
+conso_daily_grandest <-  data_conso_grandest %>% 
+                        filter(Consommation > 0) %>% # suppression des valeurs a 0
+                        mutate(Date_only = ymd(Date)) %>% # conversion en year month day
+                        mutate(Date_only = as_date(Date_only)) %>% # conversion au format date
+                        mutate(Renouvelable = (Eolien+Hydraulique+Solaire+Pompage+Bioénergies))  %>% # Creation du variable energie renouvelable
+                        select(Date_only, Consommation,Renouvelable) %>% # Selection des variables d'interet
+                        group_by(Date_only) %>% # group by daily avec moyenne 
+                        summarise_all(funs(mean(.,na.rm=TRUE))) %>% 
+                        as_tsibble(index= Date_only) %>%  # conversion du df en tsibble
+                        ungroup()
+```
+
+```{r}
+## Creation d'un dataframe month_avg
+conso_month_grandest <- conso_daily_grandest %>% 
+                            index_by(yearmonth(Date_only)) %>% # group_by(index_by) month
+                            summarise_all(funs(mean(.,na.rm=TRUE)))
+```
+
+### Analyse du df
+
+```{r}
+DataExplorer::plot_intro(conso_daily_grandest)
+questionr::describe(conso_daily_grandest)
+conso_daily_grandest %>% 
+  psych::pairs.panels(
+              method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE # show correlation ellipses
+             )
+```
+
+Pas de données manquante ou de ligne incomplète\
+2556 observations = 7 ans\
+La consommation au fil du temps a une moyenne stable = saisonnalité additive
+
+## Température
+
+### Imports des températures relevés
+
+Source : <https://www.ncdc.noaa.gov/cdo-web/search>
+
+```{r, echo = FALSE}
+## imports température strasbourg 2013 - 2019 
+temp_strasbourg_2013_2019 = read.csv("data/climat_strasbourg_2013_2019.csv",dec=".",sep=",")
+```
+
+### Création du df
+
+```{r}
+temp_strasbourg_2013_2019 <- mutate(temp_strasbourg_2013_2019,DATE = ymd(DATE)) %>% # conversion en year month day
+                            select(-SNWD) %>% # suppression de la colonne snow
+                            as_tsibble(index="DATE") # conversion du df en tsibble
+```
+
+### Analyse du df
+
+```{r warning=FALSE}
+temp_strasbourg_2013_2019 %>% questionr::describe() 
+temp_strasbourg_2013_2019 %>% DataExplorer::plot_intro()
+temp_strasbourg_2013_2019 %>% psych::pairs.panels(
+                                          method = "pearson", # correlation method
+                                         hist.col = "#00AFBB",
+                                         density = TRUE,  # show density plots
+                                         ellipses = TRUE # show correlation ellipses
+                                         )
+```
+
+Ici aussi, pas de problème particulier dans les données
+
+## DJU ( degrés jour unifiés)
+
+### Imports des DJU
+
+Source : <https://cegibat.grdf.fr/simulateur/calcul-dju>
+
+```{r}
+## Imports données (Grand est 67)
+dju_month_grandest <- read.csv("data/calcul_DJU_05_05_2021.csv",dec=",")
+```
+
+### Modification du df
+
+```{r}
+dju_month_grandest <- dju_month_grandest %>% 
+                      mutate (date = ym(DATE)) %>% 
+                      relocate(DJU, .after = last_col()) %>% 
+                      as_tsibble(index = date)
+```
+
+### Création d'un data daily par calcul
+
+En utilisation la méthode de calcul Méteo de Cegibat
+
+```{r}
+seuil_temp = 18 # seuil point de changement température
+dju_daily_grandest <- temp_strasbourg_2013_2019 %>% 
+                      mutate(
+                      dju_calc_chauffage = case_when( ## calcul DJU chauffage
+                      seuil_temp <= ((TMIN + TMAX)/2) ~ 0,
+                      seuil_temp > ((TMIN + TMAX)/2) ~ seuil_temp - ((TMIN + TMAX)/2),
+                      TRUE ~ 0),
+                      dju_calc_clim = case_when( ## Calcul DJU climatisation
+                      seuil_temp >= ((TMIN + TMAX)/2) ~ 0,
+                      seuil_temp < ((TMIN + TMAX)/2) ~ ((TMIN + TMAX)/2) -seuil_temp,
+                      TRUE ~ 0 ),
+                      dju_calc_total = dju_calc_chauffage + dju_calc_clim # calcul DJU total
+                      )
+                      
+```
+
+### Création df monthly
+
+```{r}
+dju_month_grandest_calc <- dju_daily_grandest %>% 
+                            index_by(yearmonth(DATE)) %>% 
+                            summarise_at(vars(dju_calc_chauffage:dju_calc_total),~sum(.)) 
+```
+
+### Comparaision calcul vs cegibat
+
+```{r}
+autoplot(dju_month_grandest_calc,dju_calc_chauffage,color='gray')+
+  geom_line(aes(y=dju_month_grandest$DJU), colour = "#D55E00")+
+  labs(
+    y = "DJU",
+    title = "Comparaision calcul vs cegibat"
+  )
+```
+
+Les graphiques sont proches, nous pouvons valider la méthode de calcul
+
+# Exploration des données
+
+## Création des df finaux
+
+```{r}
+## merge des dataframmes
+data_est_day <- left_join(conso_daily_grandest, dju_daily_grandest, by = c('Date_only'='DATE')) %>% 
+  select(-NAME) %>%  # Suppresion variable name 
+  as_tsibble(index = Date_only)
+```
+
+```{r}
+## Creation d'un data month
+data_est_month <- data_est_day %>% # group_by
+  index_by(yearmonth(Date_only)) %>% 
+  summarise(
+  across(c(TAVG:TMIN),~mean(.)),
+  across(c(Consommation:Renouvelable,dju_calc_chauffage:dju_calc_total,PRCP),~sum(.))
+            ) 
+```
+
+## Analyse des DF
+
+```{r}
+data_est_day %>% questionr::describe() 
+data_est_day %>% DataExplorer::plot_intro()
+data_est_day %>% psych::pairs.panels(
+                                          method = "pearson", # correlation method
+                                         hist.col = "#00AFBB",
+                                         density = TRUE,  # show density plots
+                                         ellipses = TRUE # show correlation ellipses
+                                         )
+```
+
+### Analyse graphique de la variable d'intéret consommation
+
+```{r}
+autoplot(data_est_day,Consommation)
+```
+
+La courbe ci dessus présente une saisonnalité annuelle avec une tendance stable
+
+```{r}
+data_est_day %>% gg_season(Consommation, period = "year", labels = "both")  +
+  labs(y="MW", title="Electricity demand: Grand Est")
+```
+
+```{r}
+data_est_day %>% gg_season(Consommation, period = "week", labels = "both")  +
+  labs(y="MW", title="Electricity demand: Grand Est")
+```
+
+```{r}
+ggplot(data_est_day, aes(y=Consommation,x=TAVG))+
+    geom_point()+
+    theme_classic()+
+    geom_smooth(method="lm", 
+                colour="red", 
+                formula=y~x+I(x^2)) 
+```
+
+Nous voyons bien ici une corrélation polynomiale de type y = x + x² entre la température et la consommation électrique
+
+```{r}
+## Visualisation 
+scatterplot(Consommation~dju_calc_total,data=data_est_day)
+```
+
+Idem pour ce graphique, nous notons une relation linéaire entre la consommation et les DJU
+
+## Correction de l'effet température
+
+Ici, nous allons crée une variable consommation corrigé grâce aux régressions
+
+### Correction avec DJU
+
+#### Régression linéaire
+
+```{r}
+lm_temp_corr<-lm(data_est_day$Consommation~data_est_day$dju_calc_total)
+summary(lm_temp_corr)
+a<-coef(lm_temp_corr)[2]
+b<-coef(lm_temp_corr)[1]
+```
+
+#### Vérification des conditions de validité
+
+Nous vérifions maintenant les conditions de validité de la régression linéaire
+
+```{r}
+## Independance des résidus
+acf(residuals(lm_temp_corr), main="lm_temp_corr")
+durbinWatsonTest(lm_temp_corr)
+# H0 (null hypothesis): There is no correlation among the residuals.
+# HA (alternative hypothesis): The residuals are autocorrelated.
+```
+
+Nous voyons une forte autocorrelation des résidus sur le graphe et le test de Durbin Watson nous pousse à rejeter l'hypothèse de non corrélation
+
+```{r}
+## Evaluation de l’hypothèse de normalité des résidus
+plot(lm_temp_corr,2)
+shapiro.test(residuals(lm_temp_corr))
+
+```
+
+La normalité des résidus est accepté
+
+```{r}
+## Evaluation de l’hypothèse d’homogénéité des résidus
+plot(lm_temp_corr, 3)
+ncvTest(lm_temp_corr)
+```
+
+L'homoscédasticité des residus est accepté\
+Les conditions de validité du modèle sont validées
+
+#### Consommation révisé
+
+```{r}
+data_est_day <-
+  data_est_day %>% mutate(conso_corrige_dju = Consommation - a * dju_calc_total)
+data_est_month <-
+  data_est_month %>% mutate(conso_corrige_dju = Consommation - a * dju_calc_total)
+
+```
+
+```{r}
+library(xts)
+data <- xts(x=data_est_day$conso_corrige_dju,order.by = data_est_day$Date_only)
+dygraph(data)%>% dyRangeSelector()
+```
+
+```{r}
+data_est_month %>% 
+autoplot(conso_corrige_dju)
+```
+
+### Correction avec température
+
+#### Régression polynomiale
+
+```{r}
+lm_temp_corr2<-lm(data_est_day$Consommation~data_est_day$TAVG+I(data_est_day$TAVG^2))
+summary(lm_temp_corr2)
+x<-coef(lm_temp_corr2)[2]
+x2<-coef(lm_temp_corr2)[3]
+```
+
+#### Vérification des conditions de validité
+
+Nous vérifions maintenant les conditions de validité de la régression linéaire
+
+```{r}
+## Indépendance  des residus
+acf(residuals(lm_temp_corr2), main="lm_temp_corr")
+durbinWatsonTest(lm_temp_corr2)
+# H0 (null hypothesis): There is no correlation among the residuals.
+# HA (alternative hypothesis): The residuals are autocorrelated.
+```
+
+Nous voyons une forte autocorrelation des résidus sur le graphe et le test de Durbin Watson nous pousse à rejeter l'hypothèse de non corr&lation
+
+```{r}
+## Evaluation de l’hypothèse de normalité des résidus
+plot(lm_temp_corr2,2)
+shapiro.test(residuals(lm_temp_corr2))
+
+```
+
+La normalité des résidus est accepté
+
+```{r}
+## Evaluation de l’hypothèse d’homogénéité des résidus
+plot(lm_temp_corr2, 3)
+ncvTest(lm_temp_corr2)
+```
+
+L'homoscédasticité des résidus est accepté\
+Les conditions de validité du modèle sont validé
+
+#### Consommation révisé
+
+```{r}
+data_est_day <-
+  data_est_day %>% mutate(conso_corrige_temp = Consommation - abs((x * TAVG + (x2^2)*TAVG)))
+data_temp <- data_est_day %>% 
+  index_by(yearmonth(Date_only)) %>% 
+  summarise(sum(conso_corrige_temp))
+## merge des dataframmes
+data_est_month <- left_join(data_est_month, data_temp, by = 'yearmonth(Date_only)') 
+
+```
+
+```{r}
+library(xts)
+data <- xts(x=data_est_day$conso_corrige_temp,order.by =data_est_day$Date_only)
+dygraph(data)%>% dyRangeSelector()
+```
+
+## Ajustements et transformation
+
+Afin d'améliorer la compréhention et la précision du modèle, nous pouvons transformer celui ci.Soit en désaisonnalisant ou en appliquant une transformation de box-cox
+
+### Desaisonalisation Moving average
+
+Il s'agit d'une des premières méthode de desaisonnalisation, utilisé depuis 1920. Pour estimer la tendance mensuel avec une saisonnalité annuel, nous utilisons une moyenne mobile 2x12MA
+
+```{r}
+data_est_month_ma <- data_est_month %>%
+  mutate(
+    `12-MA` = slider::slide_dbl(Consommation, mean,
+                .before = 5, .after = 6, .complete = TRUE),
+    `2x12-MA` = slider::slide_dbl(`12-MA`, mean,
+                .before = 1, .after = 0, .complete = TRUE)
+  )
+data_est_month_ma %>%
+  autoplot(Consommation, colour = "gray") +
+  geom_line(aes(y = `2x12-MA`), colour = "#D55E00") +
+  labs(y = "MW",
+       title = "Consommation")
+```
+
+### Desaisonalisation STL
+
+Une autre méthode utilisé par le census bureau est la méthode STL pour les séries additive sans variation calendaire, son principal avantage est de pouvoir traiter tout type de saisonnalité (heures, jours, mois, autres... )
+
+#### Data month
+
+```{r}
+## Desaisonnalisation de Consommation avec STL 
+dcmp_stl_conso <- data_est_month %>%
+  model(stl = STL(Consommation))
+components(dcmp_stl_conso) %>%
+  as_tsibble() %>%
+  autoplot(Consommation, color="gray") +
+  geom_line(aes(y=trend+remainder), color = "#D55E00") +
+  labs(
+    y = "MV",
+    title = "electricity consommation"
+  )
+components(dcmp_stl_conso) %>% autoplot()
+```
+
+```{r}
+## Desaisonnalisation de TAVG
+dcmp_stl_tavg <- data_est_month %>%
+  model(stl = STL(TAVG))
+components(dcmp_stl_tavg) %>%
+  as_tsibble() %>%
+  autoplot(TAVG, color="gray") +
+  geom_line(aes(y=trend), color = "#D55E00") +
+  labs(
+    y = "MV",
+    title = "Température moyenne journalière"
+  )
+components(dcmp_stl_tavg) %>% autoplot()
+```
+
+#### Data daily
+
+```{r}
+## Desaisonnalisation de la conso corrigé avec STL 
+dcmp_conso <- data_est_day %>%
+  model(stl = STL(conso_corrige_dju))
+components(dcmp_conso) %>%
+  as_tsibble() %>%
+  autoplot(conso_corrige_dju, color="gray") +
+  geom_line(aes(y=trend), color = "#D55E00") +
+  labs(
+    y = "MV",
+    title = "electricity consommation"
+  )
+components(dcmp_conso) %>% autoplot()
+
+```
+
+```{r}
+## Ajout colonne adjusted au df
+data_est_day$conso_corrige_adjusted <- components(dcmp_conso)$season_adjust
+```
+
+```{r}
+## Desaisonnalisation de TAVG
+dcmp_tavg <- data_est_day %>%
+  model(stl = STL(TAVG))
+components(dcmp_tavg) %>%
+  as_tsibble() %>%
+  autoplot(TAVG, color="gray") +
+  geom_line(aes(y=trend+remainder), color = "#D55E00") +
+  labs(
+    y = "MV",
+    title = "Température moyenne journalière"
+  )
+components(dcmp_tavg) %>% autoplot()
+```
+
+### Dessaisonalisation X13
+
+Une méthode plus récente proposé par la Spain Bank est ARIMA SEATS X13, elle s'applique uniquement aux données mensuelles
+
+```{r}
+dcmp_seats_conso <- data_est_month %>%
+  model(seats = X_13ARIMA_SEATS(conso_corrige_dju ~ seats())) %>%
+  components()
+autoplot(dcmp_seats_conso) +
+  labs(title =
+    "Decomposition of conso_corrigé using SEATS")
+dcmp_seats_conso %>%
+  ggplot(aes(x = `yearmonth(Date_only)`)) +
+  geom_line(aes(y = conso_corrige_dju, colour = "Data")) +
+  geom_line(aes(y = season_adjust,
+                colour = "Seasonally Adjusted")) +
+  geom_line(aes(y = trend, colour = "Trend")) +
+  labs(y = "MW",
+       title = "conso_corrigé (avg/month)") +
+  scale_colour_manual(
+    values = c("gray", "#0072B2", "#D55E00"),
+    breaks = c("Data", "Seasonally Adjusted", "Trend")
+  )
+```
+
+```{r}
+## Ajout colonne adjusted au df
+data_est_month$conso_corrige_adjusted <- dcmp_seats_conso$season_adjust
+```
+
+```{r}
+dcmp_seats_tavg <- data_est_month %>%
+  model(seats = X_13ARIMA_SEATS(TAVG ~ seats())) %>%
+  components()
+autoplot(dcmp_seats_tavg) +
+  labs(title =
+    "Decomposition of Temperature (avg/month) using SEATS")
+dcmp_seats_tavg %>%
+  ggplot(aes(x = `yearmonth(Date_only)`)) +
+  geom_line(aes(y = TAVG, colour = "Data")) +
+  geom_line(aes(y = season_adjust,
+                colour = "Seasonally Adjusted")) +
+  geom_line(aes(y = trend, colour = "Trend")) +
+  labs(y = "°C ",
+       title = "Temperature (avg/month)") +
+  scale_colour_manual(
+    values = c("gray", "#0072B2", "#D55E00"),
+    breaks = c("Data", "Seasonally Adjusted", "Trend")
+  )
+```
+
+Nous percevons bien ici l'impact du réchauffement climatique, avec une montée de 2° en moyenne sur 7 ans
+
+### Transformation de BoxCox
+
+Nous pouvons utiliser une transformation de boxCox sur notre variable réponse afin normaliser les résidus. Nous choississons le parametre $\\lambda$ grâce a l'indice de Guerrero\
+Cette transformation est utilisable directement dans fable, qui s'occupera alors de la transformation retour
+
+```{r}
+## Transformation de Box Cox avec indice de Guerrero
+lambda_guerrero_day <- data_est_month %>%
+  features(Consommation, features = guerrero) %>%
+  pull(lambda_guerrero)
+data_est_month %>%
+  autoplot(box_cox(Consommation, lambda_guerrero_day)) +
+  #geom_line(aes(y=Consommation), colour = "#D55E00") +
+  labs(y = "",
+       title = latex2exp::TeX(paste0(
+         "Transformed electricity consommation with $\\lambda$ = ",
+         round(lambda_guerrero_day,2))))
+
+gamma_guerrero_day <- data_est_month %>%
+  features(TAVG, features = guerrero) %>%
+  pull(lambda_guerrero)
+data_est_month %>%
+  autoplot(box_cox(TAVG, gamma_guerrero_day)) +
+  geom_line(aes(y=TAVG), colour = "#D55E00") +
+  labs(y = "",
+       title = latex2exp::TeX(paste0(
+         "Transformed température with $\\lambda$ = ",
+         round(gamma_guerrero_day,2))))
+```
+
+# Modélisation
+
+## Modèle lissage exponentielle
+
+[![](lissage_exponentiel_taxonomy.JPG "Taxonomy lissage exponentielle")](https://otexts.com/fpp3/taxonomy.html)
+
+### Modèle simple
+
+```{r}
+# Estimate parameters
+fit <- data_est_month %>%
+  model(ETS(Consommation ~ error("A") + trend("N") + season("N")))
+fc <- fit %>%
+  forecast(h ="1 years")
+```
+
+```{r}
+fc %>%
+  autoplot(data_est_month) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(fit)) +
+  labs(y="MW", title="Consommation") +
+  guides(colour = FALSE)
+```
+
+### Modèle double
+
+```{r}
+# Estimate parameters
+fit <- data_est_month %>%
+  model(ETS(Consommation ~ error("A") + trend("A") + season("N")))
+fc <- fit %>%
+  forecast(h ="1 years")
+```
+
+```{r}
+fc %>%
+  autoplot(data_est_month) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(fit)) +
+  labs(y="MW", title="Consommation") +
+  guides(colour = FALSE)
+```
+
+### Holt-Winters
+
+```{r}
+# Estimate parameters
+fit <- data_est_month %>%
+  model(ETS(Consommation ~ error("A") + trend("A") + season("A")))
+fc <- fit %>%
+  forecast(h ="1 years")
+```
+
+```{r}
+fc %>%
+  autoplot(data_est_month) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(fit)) +
+  labs(y="MW", title="Consommation") +
+  guides(colour = FALSE)
+```
+
+### Auto
+
+Testons enfin un dernier modèle en full auto
+
+```{r}
+# Estimate parameters
+fit <- data_est_month %>%
+  model(ETS(Consommation))
+fc <- fit %>%
+  forecast(h ="1 years")
+```
+
+```{r}
+report(fit)
+```
+
+```{r}
+fc %>%
+  autoplot(data_est_month) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(fit)) +
+  labs(y="MW", title="Consommation") +
+  guides(colour = FALSE)
+```
+
+## Modele ARIMA
+
+AR = Auto regressive
+
+I = Integrated
+
+MA = Mooving average
+
+S = Seaseonal
+
+Approche plutôt basé sur l'autocorrélation
+
+Nous n'utilisons plus les Trend et saisonnalité pour modéliser le processus, nous devons donc stationnarisé la série temporelle, la rendre independante du temps.
+
+### Stationnarisation
+
+Nous regardons dans un premier temps si nous avons besoin de différencier grâce a un test de racine unitaire
+
+```{r}
+data_est_month %>% 
+  features(Consommation,unitroot_nsdiffs)
+```
+
+Le test saisonnier nous préconise de différencier 1 fois la variable consommation en saisonnalité
+
+Faisons le même test mais avec le test en tendance
+
+```{r}
+data_est_month %>% 
+features(Consommation, unitroot_ndiffs)
+```
+
+Analysons le graphes des résidus de la consommation différencié
+
+```{r}
+data_est_month %>%
+  gg_tsdisplay(difference((Consommation),12), plot_type='partial')
+```
+
+Recommençons pour la variable conso désaisonnalisé.
+
+```{r}
+data_est_month %>% 
+  features(conso_corrige_adjusted,unitroot_nsdiffs)
+
+```
+
+```{r}
+data_est_month %>% 
+  features(conso_corrige_adjusted,unitroot_ndiffs)
+```
+
+Le test confirme que cette variables est déjà differencié en tendance et saisonnalité
+
+```{r}
+data_est_month %>% 
+  gg_tsdisplay((conso_corrige_adjusted), plot_type='partial')
+```
+
+### ARIMA
+
+Nous utilisons la variable Consommation corrigé de l'effet température et désaisonnalisé
+
+```{r}
+fit_arima <- data_est_month %>%
+  model(
+    auto = ARIMA(conso_corrige_adjusted),
+    arima012011 = ARIMA(conso_corrige_adjusted ~ pdq(3, 0, 2) + PDQ(0, 0, 0))## PDQ a 0 pour indiquer qu'il n'y a pas de tendance saisonière
+   # model_search = ARIMA(conso_corrige_dju ~ pdq(p=0:2, d=1, q=0:2) + PDQ(0,1,1))
+    )
+
+```
+
+```{r}
+forecast(fit_arima,h=12) %>% 
+autoplot(data_est_month)
+```
+
+```{r}
+fit_arima %>% pivot_longer(everything(), names_to = "Model name",values_to = "Orders")
+glance(fit_arima) %>% arrange(AICc) %>% select(.model:BIC)
+fit_arima %>% select(auto) %>%  report()
+```
+
+On remarque que le modèle ne performe pas très bien du fait que notre variable ressemble de plus en plus a du bruit blanc et donc très difficile de prédire
+
+### SARIMA avec correction température
+
+| p=p= | order of the autoregressive part;      |
+|-----:|:---------------------------------------|
+| d=d= | degree of first differencing involved; |
+| q=q= | order of the moving average part.      |
+
+```{r}
+fit_sarima <- data_est_month %>%
+  model(
+    auto = ARIMA(conso_corrige_dju),
+    arima012011 = ARIMA(conso_corrige_dju ~ pdq(0, 0, 2) + PDQ(0, 1, 1))
+   # model_search = ARIMA(conso_corrige_dju ~ pdq(p=0:2, d=1, q=0:2) + PDQ(0,1,1))
+    )
+
+```
+
+```{r}
+forecast(fit_sarima,h=24) %>% 
+autoplot(data_est_month)
+```
+
+```{r}
+fit_sarima %>% pivot_longer(everything(), names_to = "Model name",values_to = "Orders")
+glance(fit_sarima) %>% arrange(AICc) %>% select(.model:BIC)
+  
+```
+
+Nous devons maintenant réintroduire la correction de température
+
+Nous pouvons maintenant comparé les modèle grace a la cross-validation
+
+```{r}
+data_est_month_tr <- data_est_month %>%
+stretch_tsibble(.init = 3, .step = 1)
+
+fc <- data_est_month_tr %>%
+    model(
+    auto = ARIMA(conso_corrige_dju)
+
+    ) %>%
+  forecast(h = 24) %>%
+  group_by(.id) %>%
+  mutate(h = row_number()) %>%
+  ungroup()
+
+```
+
+```{r warning=FALSE}
+fc %>%
+  accuracy(data_est_month, by = c("h", ".model")) %>%
+  ggplot(aes(x = h, y = MAPE)) +
+  geom_point()
+```
+
+### SARIMAX (variable exogène)
+
+Ici, nous ajoutons directement des variables éxogène à notre modèle
+
+```{r}
+training <- data_est_month %>% filter(year(`yearmonth(Date_only)`) <= 2018)
+test <- data_est_month %>% filter(year(`yearmonth(Date_only)`) > 2018)
+```
+
+```{r}
+fit_sarimax <- data_est_month %>%
+ model(
+   auto = ARIMA(Consommation~ TAVG + I(TAVG^2)),    ## Auto
+   sarimax101210 = ARIMA(Consommation~ TAVG + I(TAVG^2)+pdq(1,0,1)+PDQ(2,1,0)) ## idem modele correction
+   
+ ) 
+
+
+```
+
+```{r}
+fit_sarimax %>% pivot_longer(everything(), names_to = "Model name",values_to = "Orders")
+glance(fit_sarimax) %>% arrange(AICc) %>% select(.model:BIC)
+fit_sarimax %>% 
+  select(auto) %>% 
+  report()
+fit_sarimax %>% accuracy()
+
+```
+
+```{r}
+# Time series cross-validation accuracy
+data_est_month_tr <- data_est_month %>%
+  stretch_tsibble(.init = 1, .step = 12)
+data_est_month_tr
+# TSCV accuracy
+fit <- data_est_month_tr %>%
+  model(ARIMA(Consommation)) %>%
+  forecast(h = "2 years") %>%
+  accuracy(data_est_month)
+
+
+
+```
+
+```{r}
+forecast(fit_sarimax,new_data = test) %>%
+  autoplot(data_est_month) +
+  labs(title = "Electricity demand",
+       y = "MW") + coord_cartesian(xlim = c(as_date("2018-01-01"),as_date("2019-12-31")))
+
+
+```
+
+## Modèle deep learning
+
+Cette méthode est basé sur les réseaux de neurones artificiels, nous pouvons aussi y ajouter des variables explicatives.
+
+Le temps de calcul étant relativement long, nous travaillons sur le data month. Vu que nous utilisons une variable exogene dans notre modèle, nous splittons le dataset en Train/Test
+
+```{r}
+fit_mnn <- training %>% 
+  model(
+        AutoX = NNETAR(Consommation , xreg = training$TAVG),
+        Auto = NNETAR(Consommation)
+        )
+forecast(fit_mnn,new_data = test, times = 100) %>% ## times = 200 permets de limiter le temps de calcul en dimuniant la précisions des intervalles de confiance
+  autoplot(data_est_month) +
+  labs(title = "Electricity demand",
+  y = "MW") + coord_cartesian(xlim = c(as_date("2018-01-01"),as_date("2019-12-31")))  ## Restiction pour ne voir que 2 ans de 2018 a 2019
+accuracy(fit_mnn)
+```
+
+Les résultats sont convainquant avec un MAPE de 3%
+
+## Modele Prophet
+
+Le modèle Prohet est un modèle récent de 2018 [@taylor2018] viens directement de Facebook, basé sur des régressions avec des séries de Fourier.
+
+Ses avantage sont sa simplicité d'utilisation et son intégration des effets vacances, l'incovenient principale est que nous ne maitrisons pas les choix de modèle, basé sur des critère Bayésien
+
+```{r warning=FALSE}
+library(prophet)
+library(dygraphs)
+```
+
+Nous importons un fichiers avec les jours fériés Francais, nous pourrions importer les dates des vacances mais cela nécessite plus de manipulation. De plus, ils devrais être integrés prochainement directement dans Prophet
+
+```{r}
+jours_feries <- read.csv("data/holidays_fra.csv",fileEncoding="UTF-8")
+```
+
+Nous devons renomer les variables date (ds) et d'interet (y)
+
+```{r}
+data_prophet_day <- data_est_day %>%
+  rename(ds = Date_only, y = Consommation) 
+data_prophet_month <- data_est_month %>%
+  rename(ds = `yearmonth(Date_only)`, y = Consommation) 
+```
+
+Nous renseignons le modele
+
+```{r}
+m<- prophet(holidays = jours_feries) ## ajout des jours feries
+m<- add_regressor(m,'TAVG') ## ajout variables expliquatives
+m<- fit.prophet(m,data_prophet_day) ## fit du model
+```
+
+Nous devons crées un dataframme future a partir duquel nous pourrons faire les prévision. Pour le moment, nous avons que les dates dedans, il nous faut les prévisions de la variable exliquative. Nous pourrions l'importer depuis un organisme météo, mais j'ai choisi de la prévoir directement à l'aide de Prophet
+
+```{r}
+data_prophet_temp2 <- data_prophet_day %>%
+  rename(Consomation=y,y = TAVG) ## renommage des variables
+m2 <- prophet(data_prophet_temp2) ## on renseigne le df 
+future <- make_future_dataframe(m2, periods = 365) ## on crée un df future de 1 an
+forecast <- predict(m2, future) ## on realise les predictions
+forecast_temp_2020 <- data.frame(forecast[c('ds', 'yhat')]) %>%  ## on transforme les prédictions en df
+  rename(TAVG=yhat) ## on renome TAVG
+```
+
+Nous pouvons maintenant lancer les prévisions.
+
+```{r}
+
+forecast <- predict(m, forecast_temp_2020) ## predictions
+
+prophet_plot_components(m, forecast)## composante
+
+dyplot.prophet(m, forecast,uncertainty = TRUE)## Affichage dynamique
+
+```
+
+Vérifions maintenant la qualité des prédictions à l'aide d'une cross validation
+
+```{r}
+df.cv <- cross_validation(m, horizon=365, units='days')
+plot_cross_validation_metric(df.cv, metric='mape')
+```
+
+Nous obtenons un résultat très intéressant, avec une erreur moyenne de 5%
+
+# Conclusion
+
+```{r eval=FALSE, include=FALSE}
+www_usage %>%
+  stretch_tsibble(.init = 10) %>%
+  model(
+    SES = ETS(value ~ error("A") + trend("N") + season("N")),
+    Holt = ETS(value ~ error("A") + trend("A") + season("N")),
+    Damped = ETS(value ~ error("A") + trend("Ad") +
+                   season("N"))
+  ) %>%
+  forecast(h = 1) %>%
+  accuracy(www_usage)
+```
+
+```{r eval=FALSE, include=FALSE}
+# Generate forecasts and compare accuracy over the test set
+bind_rows(
+    fit_arima %>% accuracy(),
+    fit_ets %>% accuracy(),
+    fit_arima %>% forecast(h = "2 years 6 months") %>%
+      accuracy(cement),
+    fit_ets %>% forecast(h = "2 years 6 months") %>%
+      accuracy(cement)
+  ) %>%
+  select(-ME, -MPE, -ACF1)
+```
